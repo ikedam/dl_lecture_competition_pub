@@ -1,3 +1,4 @@
+import logging
 import re
 import random
 import time
@@ -359,9 +360,14 @@ def eval(model, dataloader, optimizer, criterion, device):
 
 
 def main():
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s: %(message)s")
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+
     # deviceの設定
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info("running on %s", device)
 
     # dataloader / model
     transform = transforms.Compose([
@@ -383,9 +389,10 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
     # train model
+    logger.info("start training...")
     for epoch in range(num_epoch):
         train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
-        print(f"【{epoch + 1}/{num_epoch}】\n"
+        logger.info(f"【{epoch + 1}/{num_epoch}】\n"
               f"train time: {train_time:.2f} [s]\n"
               f"train loss: {train_loss:.4f}\n"
               f"train acc: {train_acc:.4f}\n"
