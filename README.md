@@ -2,6 +2,19 @@
 
 
 ## 環境構築
+### venv 環境
+
+```
+python -m venv ./.venv
+```
+
+次回からコマンドプロンプトで…
+
+```
+.venv\Scripts\activate.bat
+```
+
+
 ### Conda
 ```bash
 conda create -n dl_competition python=3.10
