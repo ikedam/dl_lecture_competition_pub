@@ -1,7 +1,12 @@
+import argparse
+import gzip
 import logging
 import re
 import random
 import time
+import os
+import os.path
+import typing
 from statistics import mode
 
 from PIL import Image
@@ -19,6 +24,28 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def save_seeds() -> dict[str, typing.Any]:
+    """現在の乱数状態を保存します。restore_seedsで復元します"""
+    return {
+        "random": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "torch.cuda": torch.cuda.get_rng_state(),
+        "torch.cuda_all": torch.cuda.get_rng_state_all(),
+    }
+
+
+def restore_seeds(saved: dict[str, typing.Any]) -> None:
+    """save_seeds で保存した状態で乱数を復元します"""
+    random.setstate(saved["random"])
+    np.random.set_state(saved["numpy"])
+    torch.set_rng_state(saved["torch"])
+    torch.cuda.set_rng_state(saved["torch.cuda"])
+    torch.cuda.set_rng_state_all(saved["torch.cuda_all"])
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -69,6 +96,7 @@ class VQADataset(torch.utils.data.Dataset):
         self.image_dir = image_dir  # 画像ファイルのディレクトリ
         self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
         self.answer = answer
+        self.limit = None
 
         # question / answerの辞書を作成
         self.question2idx = {}
@@ -149,6 +177,8 @@ class VQADataset(torch.utils.data.Dataset):
             return image, torch.Tensor(question)
 
     def __len__(self):
+        if self.limit:
+            return min(self.limit, len(self.df))
         return len(self.df)
 
 
@@ -364,6 +394,17 @@ def main():
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("-s", "--snapshots", type=str, default=None)
+    parser.add_argument("-l", "--limit", type=int, default=None)
+    parser.add_argument("-e", "--epoch", type=int, default=20)
+
+    args = parser.parse_args()
+
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+
     # deviceの設定
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -378,19 +419,48 @@ def main():
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
+    # 訓練データの量を制限
+    if args.limit:
+        logger.warning("limit dataset to %s", args.limit)
+        train_dataset.limit = args.limit
+        test_dataset.limit = args.limit
+
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
     model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
-    num_epoch = 20
+    startepoch = 0
+    num_epoch = args.epoch
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
+    if args.snapshots and os.path.exists(args.snapshots):
+        files = sorted(
+            [
+                f for f in os.listdir(args.snapshots)
+                if (
+                    (f.endswith(".pth") or f.endswith(".pth.gz"))
+                    and f.removesuffix(".gz").removesuffix(".pth").isdigit()
+                )
+            ],
+            reverse=True,
+        )
+        if len(files) > 0:
+            loadfile = os.path.join(args.snapshots, files[0])
+            logger.info("load from %s", loadfile)
+            startepoch = int(files[0].removesuffix(".gz").removesuffix(".pth"))
+            with gzip.open(loadfile, "rb") if loadfile.endswith(".gz") else open(loadfile, "rb") as f:
+                data = torch.load(f)
+            restore_seeds(data["random"])
+            model.load_state_dict(data["model"])
+            optimizer.load_state_dict(data["optimizer"])
+
     # train model
     logger.info("start training...")
-    for epoch in range(num_epoch):
+    for epoch in range(startepoch, num_epoch):
+        logger.info("Epoch %s/%s", epoch + 1, num_epoch)
         train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
         logger.info(f"【{epoch + 1}/{num_epoch}】\n"
               f"train time: {train_time:.2f} [s]\n"
@@ -398,7 +468,30 @@ def main():
               f"train acc: {train_acc:.4f}\n"
               f"train simple acc: {train_simple_acc:.4f}")
 
+        if args.snapshots:
+            if not os.path.exists(args.snapshots):
+                os.makedirs(args.snapshots, exist_ok=True)
+
+            # gzip 圧縮しても90%強程度にしかならない
+            # intermediatefile = os.path.join(args.snapshots, ("%04d.pth.gz" % (epoch + 1, )))
+            intermediatefile = os.path.join(args.snapshots, ("%04d.pth" % (epoch + 1, )))
+            if not os.path.exists(intermediatefile):
+                with gzip.open(intermediatefile, "wb") if intermediatefile.endswith(".gz") else open(intermediatefile, "wb") as f:
+                    torch.save(
+                        {
+                            "model": model.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "random": save_seeds(),
+                        },
+                        f,
+                    )
+                logger.info("save %s", intermediatefile)
+            else:
+                logger.warning("skip saving %s as already exists", intermediatefile)
+
+
     # 提出用ファイルの作成
+    logger.info("evaluating...")
     model.eval()
     submission = []
     for image, question in test_loader:
@@ -409,6 +502,7 @@ def main():
 
     submission = [train_dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)
+    logger.info("evaluation done.")
     torch.save(model.state_dict(), "model.pth")
     np.save("submission.npy", submission)
 
