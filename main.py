@@ -2,6 +2,7 @@ import argparse
 import collections
 import gzip
 import logging
+import math
 import re
 import random
 import time
@@ -18,6 +19,7 @@ import torchtext
 torchtext.disable_torchtext_deprecation_warning()
 
 from PIL import Image
+import einops
 import numpy as np
 import pandas
 import torch
@@ -26,6 +28,7 @@ import torchtext.data.utils
 import torchtext.vocab
 from torch.nn import functional
 from torchvision import transforms
+from einops.layers import torch as einopstorch
 
 
 def set_seed(seed):
@@ -302,9 +305,11 @@ class ResNet(nn.Module):
         super().__init__()
         self.in_channels = 64
 
+        # 3 x h x w -> 64 x h/2 x w/2
         self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3)
         self.bn1 = nn.BatchNorm2d(64)
         self.relu = nn.ReLU(inplace=True)
+        #  -> 64 x h/4 x w/4
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
         self.layer1 = self._make_layer(block, layers[0], 64)
@@ -348,17 +353,150 @@ def ResNet50():
     return ResNet(BottleneckBlock, [3, 4, 6, 3])
 
 
+# 第9回演習
+# Multi-Head Attentionの実装
+# 質問文に対する、画像の特徴量の重み付けを行う。
+# Query: 質問文のベクトル
+# Key / Value: 画像の特徴量
+class MultiHeadAttention(nn.Module):
+    def __init__(self, text_dim, image_dim, heads, dim_head, dropout=0.):
+        """
+        Arguments
+        ---------
+        text_dim : int
+            質問文の次元数
+        image_dim : int
+            画像の特徴量の次元数
+        heads : int
+            ヘッドの数
+        dim_head : int
+            各ヘッドのデータの次元数
+        dropout : float
+            Dropoutの確率(default=0.)
+        """
+        super().__init__()
+
+        self.text_dim = text_dim
+        self.image_dim = image_dim
+        self.dim_head = dim_head
+
+        self.heads = heads
+        self.scale = math.sqrt(dim_head)  # ソフトマックス関数を適用する前のスケーリング係数(dim_k)
+
+        self.attend = nn.Softmax(dim=-1)  # アテンションスコアの算出に利用するソフトマックス関数
+        self.dropout = nn.Dropout(dropout)
+
+        # Q, K, Vに変換するための全結合層
+        self.to_q = nn.Linear(in_features=text_dim, out_features=dim_head * heads)
+        self.to_k = nn.Linear(in_features=image_dim, out_features=dim_head * heads)
+        self.to_v = nn.Linear(in_features=image_dim, out_features=dim_head * heads)
+        self.to_out = nn.Sequential(
+            nn.Linear(in_features=dim_head * heads, out_features=image_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, text, image):
+        # 入力データをQ, K, Vに変換する
+        # (B, text_dim) -> (B, inner_dim)
+        # (B, image_dim) -> (B, inner_dim)
+        q = self.to_q(text)
+        k = self.to_k(image)
+        v = self.to_v(image)
+
+        # Q, K, Vをヘッドに分割する
+        # inner_dim = head * dim
+        # B, heads * dim_head -> B, heads, dim_head
+        q = einops.rearrange(q, "b (h d) -> b h d", h=self.heads, d=self.dim_head)
+        k = einops.rearrange(k, "b (h d) -> b h d", h=self.heads, d=self.dim_head)
+        v = einops.rearrange(v, "b (h d) -> b h d", h=self.heads, d=self.dim_head)
+
+        # QK^T / sqrt(d_k)を計算する
+        # (B, heads, dim_head) x (B, heads, dim_head) -> (B, heads, heads)
+        dots = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+
+        # ソフトマックス関数でスコアを算出し，Dropoutをする
+        attn = self.attend(dots)
+        attn = self.dropout(attn)
+
+        # softmax(QK^T / sqrt(d_k))Vを計算する
+        # (B, heads, heads) x (B, heads, dim_head) -> (B, heads, dim_head)
+        out = torch.matmul(attn, v)
+
+        # もとの形に戻す
+        # (B, heads, dim_head) -> (B, dim)
+        out = einops.rearrange(out, "b h d -> b (h d)", h=self.heads, d=self.dim_head)
+
+        # 次元をもとに戻して出力
+        return self.to_out(out)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, text_dim, image_dim, heads, dim_head, hidden_dim, dropout=0.):
+        """
+        TransformerのEncoder Blockの実装.
+
+        Arguments
+        ---------
+        text_dim : int
+            質問文の次元数
+        image_dim : int
+            画像の特徴量の次元数
+        heads : int
+            Multi-Head Attentionのヘッドの数
+        dim_head : int
+            Multi-Head Attentionの各ヘッドの次元数
+        hidden_dim : int
+            Feed-Forward Networkの隠れ層の次元数
+        dropout : float
+            Droptou層の確率p
+        """
+        super().__init__()
+
+        # Attention前のLayerNorm (レイヤー正規化)
+        self.attn_ln_text = nn.LayerNorm(text_dim)
+        self.attn_ln_image = nn.LayerNorm(image_dim)  # Attention前のLayerNorm (レイヤー正規化)
+        self.attn = MultiHeadAttention(text_dim, image_dim, heads, dim_head, dropout)
+        self.ffn_ln = nn.LayerNorm(image_dim)  # FFN前のLayerNorm
+        self.ffn = nn.Sequential(
+            nn.Linear(in_features=image_dim, out_features=hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(in_features=hidden_dim, out_features=image_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, text, image):
+        y = self.attn(self.attn_ln_text(text), self.attn_ln(image))
+        x = y + x # skip connection
+        out = self.ffn(self.ffn_ln(x)) + x
+
+        return out
+
+
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
         self.resnet = ResNet18()
 
-        emb_dim = 512
+        text_emb_dim = 512
         self.embedding_matrix = nn.Parameter(
-            torch.rand((vocab_size, emb_dim), dtype=torch.float),
+            torch.rand((vocab_size, text_emb_dim), dtype=torch.float),
         )
         lstm_dim = 256
-        self.bilstm = nn.LSTM(emb_dim, lstm_dim, 1, batch_first=True, bidirectional=True)
+        self.bilstm = nn.LSTM(text_emb_dim, lstm_dim, 1, batch_first=True, bidirectional=True)
+
+        heads = 10
+        dim_head = 64
+        hidden_dim = 192
+        transformers = 4
+        image_dim = 512
+        self.transformer = torch.nn.Sequential(*[TransformerBlock(
+            lstm_dim * 2,
+            image_dim,
+            heads,
+            dim_head,
+            hidden_dim
+        ) for _ in range(transformers)])
 
         self.fc = nn.Sequential(
             nn.Linear(1024, 512),
@@ -381,6 +519,8 @@ class VQAModel(nn.Module):
         out, hc = self.bilstm(emb)  # テキストの特徴量
         h, c = hc
         question_feature = torch.cat([h[0], h[1]], dim=1)
+
+        image_feature = self.transformer(question_feature, image_feature)
 
         x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
