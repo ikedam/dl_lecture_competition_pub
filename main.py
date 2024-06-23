@@ -115,12 +115,8 @@ class VQADataset(torch.utils.data.Dataset):
         self.idx2answer = {}
 
         # 質問文に含まれる単語を辞書に追加
-        # 質問文は正規化した状態にする
-        for idx, question in enumerate(self.df["question"]):
+        for question in self.df["question"]:
             question = process_text(question)
-            self.df["question"][idx] = question
-            # pandas の扱いにそれほど自信がない
-            assert question == self.df["question"][idx]
             words = question.split(" ")
             for word in words:
                 if word not in self.question2idx:
@@ -129,14 +125,10 @@ class VQADataset(torch.utils.data.Dataset):
 
         if self.answer:
             # 回答に含まれる単語を辞書に追加
-            # 回答を正規化しておく
-            for p_idx, answers in enumerate(self.df["answers"]):
-                for c_idx, answer in enumerate(answers):
+            for answers in self.df["answers"]:
+                for answer in answers:
                     word = answer["answer"]
                     word = process_text(word)
-                    answer["answer"] = word
-                    # pandas の扱いにそれほど自信がない
-                    assert word == self.df["answers"][p_idx][c_idx]["answer"]
                     if word not in self.answer2idx:
                         self.answer2idx[word] = len(self.answer2idx)
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
@@ -186,7 +178,7 @@ class VQADataset(torch.utils.data.Dataset):
                 question[-1] = 1  # 未知語
 
         if self.answer:
-            answers = [self.answer2idx[answer["answer"]] for answer in self.df["answers"][idx]]
+            answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
 
             return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
