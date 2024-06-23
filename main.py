@@ -1,4 +1,5 @@
 import argparse
+import collections
 import gzip
 import logging
 import re
@@ -14,7 +15,9 @@ import numpy as np
 import pandas
 import torch
 import torch.nn as nn
-import torchvision
+import torchtext.data.utils
+import torchtext.vocab
+from torch.nn import functional
 from torchvision import transforms
 
 
@@ -101,6 +104,11 @@ def process_text(text):
 
 # 1. データローダーの作成
 class VQADataset(torch.utils.data.Dataset):
+    BOS = "<BOS>"
+    EOS = "<EOS>"
+    PAD = "<PAD>"
+    UNK = "<unk>"
+
     def __init__(self, df_path, image_dir, transform=None, answer=True):
         self.transform = transform  # 画像の前処理
         self.image_dir = image_dir  # 画像ファイルのディレクトリ
@@ -108,20 +116,29 @@ class VQADataset(torch.utils.data.Dataset):
         self.answer = answer
         self.limit = None
 
-        # question / answerの辞書を作成
-        self.question2idx = {}
+        # answerの辞書を作成
         self.answer2idx = {}
-        self.idx2question = {}
         self.idx2answer = {}
 
+        # 単語分割の実施 (第6回演習)
+        self.tokenizer = torchtext.data.utils.get_tokenizer("basic_english")
+        self.counter = collections.Counter()
+
         # 質問文に含まれる単語を辞書に追加
+        # 質問文の最大長も確認 (バッチの作成で長さを揃えるため)
+        self.max_question = 0
         for question in self.df["question"]:
-            question = process_text(question)
-            words = question.split(" ")
-            for word in words:
-                if word not in self.question2idx:
-                    self.question2idx[word] = len(self.question2idx)
-        self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
+            tokens = self.tokenizer(question)
+            self.counter.update(tokens)
+            self.max_question = max(len(tokens), self.max_question)
+        self.vocabulary = torchtext.vocab.vocab(
+            self.counter,
+            # 1 回だけの単語は omit する。
+            min_freq=2,
+            specials=(self.UNK, self.PAD, self.BOS, self.EOS)
+        )
+        # <unk>をデフォルトに設定することにより，min_freq回以上出てこない単語は<unk>になる
+        self.vocabulary.set_default_index(self.vocabulary[self.UNK])
 
         if self.answer:
             # 回答に含まれる単語を辞書に追加
@@ -142,9 +159,8 @@ class VQADataset(torch.utils.data.Dataset):
         dataset : Dataset
             訓練データのDataset
         """
-        self.question2idx = dataset.question2idx
+        self.vocabulary = dataset.vocabulary
         self.answer2idx = dataset.answer2idx
-        self.idx2question = dataset.idx2question
         self.idx2answer = dataset.idx2answer
 
     def __getitem__(self, idx):
@@ -169,22 +185,19 @@ class VQADataset(torch.utils.data.Dataset):
         """
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
-        question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
-        question_words = self.df["question"][idx].split(" ")
-        for word in question_words:
-            try:
-                question[self.question2idx[word]] = 1  # one-hot表現に変換
-            except KeyError:
-                question[-1] = 1  # 未知語
+
+        question = [self.vocabulary[token] for token in self.tokenizer(self.df["question"][idx])]
+        pad_num = self.max_question - len(question)
+        question = [self.vocabulary[self.BOS]] + question + [self.vocabulary[self.EOS]] + [self.vocabulary[self.PAD]] * pad_num
 
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
 
-            return image, torch.Tensor(question), torch.Tensor(answers), int(mode_answer_idx)
+            return image, torch.Tensor(question).to(torch.int64), torch.Tensor(answers), int(mode_answer_idx)
 
         else:
-            return image, torch.Tensor(question)
+            return image, torch.Tensor(question).to(torch.int64)
 
     def __len__(self):
         if self.limit:
@@ -332,7 +345,13 @@ class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
         self.resnet = ResNet18()
-        self.text_encoder = nn.Linear(vocab_size, 512)
+
+        emb_dim = 512
+        self.embedding_matrix = nn.Parameter(
+            torch.rand((vocab_size, emb_dim), dtype=torch.float),
+        )
+        lstm_dim = 256
+        self.bilstm = nn.LSTM(emb_dim, lstm_dim, 1, batch_first=True, bidirectional=True)
 
         self.fc = nn.Sequential(
             nn.Linear(1024, 512),
@@ -342,7 +361,19 @@ class VQAModel(nn.Module):
 
     def forward(self, image, question):
         image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(question)  # テキストの特徴量
+
+        # question: [バッチサイズ, 系列長, vocab_size]
+        # → [バッチサイズ, 系列長, emb_dim]
+        # → [バッチサイズ, lstm_dim] x 2
+        # → [バッチサイズ, lstm_dim x 2]
+        # out: 各単語の隠れ出力
+        # hc: (h, c)
+        # h: (フォーワードの最終出力, バックワードの最終出力)
+        # c: セルのパラメーター
+        emb = functional.embedding(question, self.embedding_matrix)
+        out, hc = self.bilstm(emb)  # テキストの特徴量
+        h, c = hc
+        question_feature = torch.cat([h[0], h[1]], dim=1)
 
         x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
@@ -430,6 +461,21 @@ def main():
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
     test_dataset.update_dict(train_dataset)
 
+    logger.info(
+        "Train info: datasize=%s, vocab size=%s/%s, max_question_len=%s",
+        format(len(train_dataset), ","),
+        format(len(train_dataset.vocabulary), ","),
+        format(len(train_dataset.counter), ","),
+        train_dataset.max_question,
+    )
+    logger.info(
+        "Test info: datasize=%s, vocab size=%s/%s, max_question_len=%s",
+        format(len(test_dataset), ","),
+        format(len(test_dataset.vocabulary), ","),
+        format(len(test_dataset.counter), ","),
+        test_dataset.max_question,
+    )
+
     # 訓練データの量を制限
     if args.limit:
         logger.warning("limit dataset to %s", args.limit)
@@ -445,7 +491,7 @@ def main():
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=os.cpu_count(), pin_memory=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=os.cpu_count(), pin_memory=True)
 
-    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+    model = VQAModel(vocab_size=len(train_dataset.vocabulary), n_answer=len(train_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
     startepoch = 0
