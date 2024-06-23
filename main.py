@@ -116,7 +116,7 @@ class VQADataset(torch.utils.data.Dataset):
     PAD = "<PAD>"
     UNK = "<unk>"
 
-    def __init__(self, df_path, image_dir, transform=None, answer=True):
+    def __init__(self, df_path, image_dir, min_freq, transform=None, answer=True):
         self.transform = transform  # 画像の前処理
         self.image_dir = image_dir  # 画像ファイルのディレクトリ
         self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
@@ -140,8 +140,7 @@ class VQADataset(torch.utils.data.Dataset):
             self.max_question = max(len(tokens), self.max_question)
         self.vocabulary = torchtext.vocab.vocab(
             self.counter,
-            # 1 回だけの単語は omit する。
-            min_freq=2,
+            min_freq=min_freq,
             specials=(self.UNK, self.PAD, self.BOS, self.EOS)
         )
         # <unk>をデフォルトに設定することにより，min_freq回以上出てこない単語は<unk>になる
@@ -447,6 +446,8 @@ def main():
     parser.add_argument("-s", "--snapshots", type=str, default=None)
     parser.add_argument("-l", "--limit", type=int, default=None)
     parser.add_argument("-e", "--epoch", type=int, default=20)
+    # 2だと性能が下がる
+    parser.add_argument("-f", "--freq", type=int, default=1)
     parser.add_argument("--holdout", type=float, default=0.25)
 
     args = parser.parse_args()
@@ -465,29 +466,15 @@ def main():
         transforms.Resize((224, 224)),
         transforms.ToTensor()
     ])
-    trainval_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
-
-    logger.info(
-        "TrainVal info: datasize=%s, vocab size=%s",
-        format(len(trainval_dataset), ","),
-        format(len(trainval_dataset.question2idx), ","),
-    )
-    logger.info(
-        "Test info: datasize=%s, vocab size=%s",
-        format(len(test_dataset), ","),
-        format(len(test_dataset.question2idx), ","),
-    )
-
-
-    test_dataset.update_dict(trainval_dataset)
+    trainval_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", min_freq=args.freq, transform=transform)
+    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", min_freq=args.freq, transform=transform, answer=False)
 
     logger.info(
         "Train info: datasize=%s, vocab size=%s/%s, max_question_len=%s",
-        format(len(train_dataset), ","),
-        format(len(train_dataset.vocabulary), ","),
-        format(len(train_dataset.counter), ","),
-        train_dataset.max_question,
+        format(len(trainval_dataset), ","),
+        format(len(trainval_dataset.vocabulary), ","),
+        format(len(trainval_dataset.counter), ","),
+        trainval_dataset.max_question,
     )
     logger.info(
         "Test info: datasize=%s, vocab size=%s/%s, max_question_len=%s",
@@ -496,6 +483,8 @@ def main():
         format(len(test_dataset.counter), ","),
         test_dataset.max_question,
     )
+
+    test_dataset.update_dict(trainval_dataset)
 
     # 訓練データの量を制限
     if args.limit:
