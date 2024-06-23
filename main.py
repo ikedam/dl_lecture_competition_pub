@@ -419,6 +419,7 @@ def main():
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info("running on %s", device)
+    logger.info("cpu_count %s", os.cpu_count())
 
     # dataloader / model
     transform = transforms.Compose([
@@ -435,8 +436,14 @@ def main():
         train_dataset.limit = args.limit
         test_dataset.limit = args.limit
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=2, pin_memory=True)
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
+    # https://qiita.com/sugulu_Ogawa_ISID/items/62f5f7adee083d96a587#1-dataloader%E3%81%AB%E3%81%A4%E3%81%84%E3%81%A6
+    # に従った最適化を実施
+    # なおColabT4環境で検証した限りでは、
+    # num_workers は 2 にすると 20% ほど高速化、それより大きくしても目立った変化なし
+    # pin_memory は True にしても目立った変化なし
+    # であった。
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=os.cpu_count(), pin_memory=True)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=os.cpu_count(), pin_memory=True)
 
     model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
 
