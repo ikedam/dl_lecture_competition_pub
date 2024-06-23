@@ -10,6 +10,13 @@ import os.path
 import typing
 from statistics import mode
 
+# /!\ IMPORTANT WARNING ABOUT TORCHTEXT STATUS /!\ 
+# Torchtext is deprecated and the last released version will be 0.18 (this one).
+# # You can silence this warning by calling the following at the beginnign of your scripts:
+# `import torchtext; torchtext.disable_torchtext_deprecation_warning()`
+import torchtext
+torchtext.disable_torchtext_deprecation_warning()
+
 from PIL import Image
 import numpy as np
 import pandas
