@@ -51,6 +51,11 @@ def restore_seeds(saved: dict[str, typing.Any]) -> None:
 
 
 def process_text(text):
+    """文章の正規化
+
+    https://visualqa.org/evaluation.html
+    におおよそ準じた変換
+    """
     # lowercase
     text = text.lower()
 
@@ -63,13 +68,14 @@ def process_text(text):
     for word, digit in num_word_to_digit.items():
         text = text.replace(word, digit)
 
-    # 小数点のピリオドを削除
+    # 小数点(追記: 「以外」が抜けてる)のピリオドを削除
     text = re.sub(r'(?<!\d)\.(?!\d)', '', text)
 
     # 冠詞の削除
     text = re.sub(r'\b(a|an|the)\b', '', text)
 
     # 短縮形のカンマの追加
+    # 追記: 「アポストロフィ」の意味。
     contractions = {
         "dont": "don't", "isnt": "isn't", "arent": "aren't", "wont": "won't",
         "cant": "can't", "wouldnt": "wouldn't", "couldnt": "couldn't"
@@ -78,9 +84,13 @@ def process_text(text):
         text = text.replace(contraction, correct)
 
     # 句読点をスペースに変換
+    # 追記: alnum, 空白文字、アポストロフィ、コロン以外の文字をスペースに変換
+    # コロンは時刻で使われている場合に重要なので残している。
     text = re.sub(r"[^\w\s':]", ' ', text)
 
     # 句読点をスペースに変換
+    # 「数字に含まれるカンマは空白に変換しない」を何らかの理由でミスって実装したと思われる。
+    # 実際には直前の変換処理でカンマは残っていないので、無意味な処理。
     text = re.sub(r'\s+,', ',', text)
 
     # 連続するスペースを1つに変換
