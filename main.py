@@ -2,6 +2,7 @@ import argparse
 import collections
 import gzip
 import logging
+import math
 import re
 import random
 import time
@@ -18,13 +19,14 @@ import torchtext
 torchtext.disable_torchtext_deprecation_warning()
 
 from PIL import Image
+import einops
 import numpy as np
 import pandas
 import torch
 import torch.nn as nn
 import torchtext.data.utils
 import torchtext.vocab
-from torch.nn import functional
+from einops.layers import torch as einopstorch
 from torchvision import transforms
 
 
@@ -111,8 +113,6 @@ def process_text(text):
 
 # 1. データローダーの作成
 class VQADataset(torch.utils.data.Dataset):
-    BOS = "<BOS>"
-    EOS = "<EOS>"
     PAD = "<PAD>"
     UNK = "<unk>"
 
@@ -141,7 +141,7 @@ class VQADataset(torch.utils.data.Dataset):
         self.vocabulary = torchtext.vocab.vocab(
             self.counter,
             min_freq=min_freq,
-            specials=(self.UNK, self.PAD, self.BOS, self.EOS)
+            specials=(self.UNK, self.PAD)
         )
         # <unk>をデフォルトに設定することにより，min_freq回以上出てこない単語は<unk>になる
         self.vocabulary.set_default_index(self.vocabulary[self.UNK])
@@ -194,7 +194,7 @@ class VQADataset(torch.utils.data.Dataset):
 
         question = [self.vocabulary[token] for token in self.tokenizer(self.df["question"][idx])]
         pad_num = self.max_question - len(question)
-        question = [self.vocabulary[self.BOS]] + question + [self.vocabulary[self.EOS]] + [self.vocabulary[self.PAD]] * pad_num
+        question = question + [self.vocabulary[self.PAD]] * pad_num
 
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
@@ -347,18 +347,145 @@ def ResNet50():
     return ResNet(BottleneckBlock, [3, 4, 6, 3])
 
 
-class VQAModel(nn.Module):
-    def __init__(self, vocab_size: int, n_answer: int):
+# https://pytorch.org/tutorials/beginner/translation_transformer.html
+class PositionalEncoding(nn.Module):
+    def __init__(
+        self,
+        emb_size: int,
+        dropout: float = 0.0,
+        maxlen: int = 5000,
+    ):
         super().__init__()
+        den = torch.exp(- torch.arange(0, emb_size, 2)* math.log(10000) / emb_size)
+        pos = torch.arange(0, maxlen).reshape(maxlen, 1)
+        pos_embedding = torch.zeros((maxlen, emb_size))
+        pos_embedding[:, 0::2] = torch.sin(pos * den)
+        pos_embedding[:, 1::2] = torch.cos(pos * den)
+        pos_embedding = pos_embedding.unsqueeze(0)
+
+        self.dropout = nn.Dropout(dropout)
+        # 学習はしないが to() などの処理対象にはする
+        self.register_buffer("pos_embedding", pos_embedding)
+
+    def forward(self, token_embedding: torch.Tensor) -> torch.Tensor:
+        pos: torch.Tensor = self.pos_embedding[:, :token_embedding.size(1), :]
+        return self.dropout(token_embedding + pos)
+
+
+class MultiHeadAttention(nn.Module):
+    """Multi-Head Attention
+
+    第8回演習より。
+    Attention(X) = softmax(QK^T / sqrt(dim_k))V
+    torch にもあるけれどもイマイチ使い方がわからん。
+    """
+
+    def __init__(self, emb_dim: int, heads: int, head_dim: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.emb_dim = emb_dim
+        self.heads = heads
+        self.head_dim = head_dim
+        self.scale = math.sqrt(head_dim)
+
+        self.to_q = nn.Linear(in_features=emb_dim, out_features=heads * head_dim)
+        self.to_k = nn.Linear(in_features=emb_dim, out_features=heads * head_dim)
+        self.to_v = nn.Linear(in_features=emb_dim, out_features=heads * head_dim)
+        self.to_out = nn.Sequential(
+          nn.Linear(in_features=heads * head_dim, out_features=emb_dim),
+          nn.Dropout(dropout),
+        )
+
+        self.softmax = nn.Softmax(dim=-1)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+      q = self.to_q(x)
+      k = self.to_k(x)
+      v = self.to_v(x)
+
+      # ヘッドに分割
+      # B, N, heads * head_dim -> B, heads, N, head_dim
+      q = einops.rearrange(q, 'b n (h d) -> b h n d', h=self.heads, d=self.head_dim)
+      k = einops.rearrange(k, 'b n (h d) -> b h n d', h=self.heads, d=self.head_dim)
+      v = einops.rearrange(v, 'b n (h d) -> b h n d', h=self.heads, d=self.head_dim)
+
+      attn = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+      # ここを torch.softmax() に変えたら違うもんなの？
+      attn = self.softmax(attn)
+      # ここのドロップアウトの意味はよくわかんない
+      attn = self.dropout(attn)
+
+      out = torch.matmul(attn, v)
+
+      # ヘッドを統合
+      # B, heads, N, head_dim -> B, N, heads * head_dim
+      # 実はここの h= d= はなくてもいいように処理してくれるような気もする。
+      out = einops.rearrange(out, 'b h n d -> b n (h d)', h=self.heads, d=self.head_dim)
+
+      out = self.to_out(out)
+
+      return out
+
+
+class TransformerBlock(nn.Module):
+    """Transformerのエンコーダーの部分だけ。
+
+    参考: 第8回演習から流用
+    """
+    def __init__(self, emb_dim: int, heads: int, head_dim: int, hidden_dim: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.attn_in = nn.LayerNorm(emb_dim)
+        self.attn = MultiHeadAttention(emb_dim=emb_dim, heads=heads, head_dim=head_dim, dropout=dropout)
+        self.ffn_in = nn.LayerNorm(emb_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(in_features=emb_dim, out_features=hidden_dim),
+            # GELU: Gaussian Error Liniear Unit
+            # RELU が x < 0 で x・0、 x > 1 で x・1
+            # GELU が x ・ 正規分布の累積確率 で、滑らかな RELU になる。
+            # https://qiita.com/nishiha/items/207f6d7eacce344e3c5e
+            # 入力が 1 か -1 に近づきやすくなり、正則化の機能を含む…の説明が一番理解しやすかった。正しいのかはあやしい。
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(in_features=hidden_dim, out_features=emb_dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.attn_in(x))
+        x = x + self.ffn(self.ffn_in(x))
+        return x
+
+
+class VQAModel(nn.Module):
+    def __init__(self, vocab_size: int, n_answer: int, max_question: int):
+        super().__init__()
+        # 3 x 224 x 224 → 512
         self.resnet = ResNet18()
 
+        # テキストのエンコーダー
         emb_dim = 512
-        self.embedding_matrix = nn.Parameter(
-            torch.rand((vocab_size, emb_dim), dtype=torch.float),
+        layers = 6
+        heads = 20
+        head_dim = 64
+        hidden_dim = 256
+        self.text_encoder = nn.Sequential(
+            nn.Embedding(vocab_size, emb_dim),
+            PositionalEncoding(emb_dim, maxlen=max_question),
+            *[TransformerBlock(
+                emb_dim=emb_dim,
+                heads=heads,
+                head_dim=head_dim,
+                hidden_dim=hidden_dim,
+            ) for _ in range(layers)],
+            einopstorch.Rearrange(
+                "b w d -> b (w d)",
+                w=max_question,
+                d=emb_dim,
+            ),
+            nn.Linear(in_features=max_question*emb_dim, out_features=emb_dim),
         )
-        lstm_dim = 256
-        self.bilstm = nn.LSTM(emb_dim, lstm_dim, 1, batch_first=True, bidirectional=True)
 
+        # 結合層
         self.fc = nn.Sequential(
             nn.Linear(1024, 512),
             nn.ReLU(inplace=True),
@@ -367,19 +494,7 @@ class VQAModel(nn.Module):
 
     def forward(self, image, question):
         image_feature = self.resnet(image)  # 画像の特徴量
-
-        # question: [バッチサイズ, 系列長, vocab_size]
-        # → [バッチサイズ, 系列長, emb_dim]
-        # → [バッチサイズ, lstm_dim] x 2
-        # → [バッチサイズ, lstm_dim x 2]
-        # out: 各単語の隠れ出力
-        # hc: (h, c)
-        # h: (フォーワードの最終出力, バックワードの最終出力)
-        # c: セルのパラメーター
-        emb = functional.embedding(question, self.embedding_matrix)
-        out, hc = self.bilstm(emb)  # テキストの特徴量
-        h, c = hc
-        question_feature = torch.cat([h[0], h[1]], dim=1)
+        question_feature = self.text_encoder(question)
 
         x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
@@ -485,6 +600,9 @@ def main():
     )
 
     test_dataset.update_dict(trainval_dataset)
+    max_question = max(trainval_dataset.max_question, test_dataset.max_question)
+    trainval_dataset.max_question = max_question
+    test_dataset.max_question = max_question
 
     # 訓練データの量を制限
     if args.limit:
@@ -504,7 +622,11 @@ def main():
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=128, shuffle=True, num_workers=os.cpu_count(), pin_memory=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=os.cpu_count(), pin_memory=True)
 
-    model = VQAModel(vocab_size=len(trainval_dataset.vocabulary), n_answer=len(trainval_dataset.answer2idx)).to(device)
+    model = VQAModel(
+        vocab_size=len(trainval_dataset.vocabulary),
+        n_answer=len(trainval_dataset.answer2idx),
+        max_question=max(trainval_dataset.max_question, test_dataset.max_question),
+    ).to(device)
 
     # optimizer / criterion
     startepoch = 0
