@@ -393,7 +393,7 @@ def eval(model, dataloader, optimizer, criterion, device):
 
         total_loss += loss.item()
         total_acc += VQA_criterion(pred.argmax(1), answers)  # VQA accuracy
-        simple_acc += (pred.argmax(1) == mode_answer).mean().item()  # simple accuracy
+        simple_acc += (pred.argmax(1) == mode_answer).float().mean().item()  # simple accuracy
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
@@ -494,7 +494,7 @@ def main():
     logger.info("start training from %s/%s...", startepoch + 1, num_epoch)
     for epoch in range(startepoch, num_epoch):
         train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
-        eval_loss, eval_acc, eval_simple_acc, eval_time = train(model, val_loader, optimizer, criterion, device)
+        eval_loss, eval_acc, eval_simple_acc, eval_time = eval(model, val_loader, optimizer, criterion, device)
         logger.info(f"【{epoch + 1}/{num_epoch}】"
               f" train time: {train_time:.2f} [s]"
               f" loss: {train_loss:.4f}"
