@@ -14,7 +14,6 @@ import numpy as np
 import pandas
 import torch
 import torch.nn as nn
-import torchvision
 from torchvision import transforms
 
 
@@ -409,6 +408,7 @@ def main():
     parser.add_argument("-s", "--snapshots", type=str, default=None)
     parser.add_argument("-l", "--limit", type=int, default=None)
     parser.add_argument("-e", "--epoch", type=int, default=20)
+    parser.add_argument("--holdout", type=float, default=0.25)
 
     args = parser.parse_args()
 
@@ -426,15 +426,30 @@ def main():
         transforms.Resize((224, 224)),
         transforms.ToTensor()
     ])
-    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
+    trainval_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
     test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
-    test_dataset.update_dict(train_dataset)
+
+    logger.info(
+        "TrainVal info: datasize=%s, vocab size=%s",
+        format(len(trainval_dataset), ","),
+        format(len(trainval_dataset.question2idx), ","),
+    )
+    logger.info(
+        "Test info: datasize=%s, vocab size=%s",
+        format(len(test_dataset), ","),
+        format(len(test_dataset.question2idx), ","),
+    )
+
+
+    test_dataset.update_dict(trainval_dataset)
 
     # 訓練データの量を制限
     if args.limit:
         logger.warning("limit dataset to %s", args.limit)
-        train_dataset.limit = args.limit
+        trainval_dataset.limit = args.limit
         test_dataset.limit = args.limit
+
+    train_dataset, val_dataset = torch.utils.data.random_split(trainval_dataset, [1.0 - args.holdout, args.holdout])
 
     # https://qiita.com/sugulu_Ogawa_ISID/items/62f5f7adee083d96a587#1-dataloader%E3%81%AB%E3%81%A4%E3%81%84%E3%81%A6
     # に従った最適化を実施
@@ -443,9 +458,10 @@ def main():
     # pin_memory は True にしても目立った変化なし
     # であった。
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=os.cpu_count(), pin_memory=True)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=128, shuffle=True, num_workers=os.cpu_count(), pin_memory=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=os.cpu_count(), pin_memory=True)
 
-    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+    model = VQAModel(vocab_size=len(trainval_dataset.question2idx)+1, n_answer=len(trainval_dataset.answer2idx)).to(device)
 
     # optimizer / criterion
     startepoch = 0
@@ -475,15 +491,20 @@ def main():
             optimizer.load_state_dict(data["optimizer"])
 
     # train model
-    logger.info("start training...")
+    logger.info("start training from %s/%s...", startepoch + 1, num_epoch)
     for epoch in range(startepoch, num_epoch):
-        logger.info("Epoch %s/%s", epoch + 1, num_epoch)
         train_loss, train_acc, train_simple_acc, train_time = train(model, train_loader, optimizer, criterion, device)
-        logger.info(f"【{epoch + 1}/{num_epoch}】\n"
-              f"train time: {train_time:.2f} [s]\n"
-              f"train loss: {train_loss:.4f}\n"
-              f"train acc: {train_acc:.4f}\n"
-              f"train simple acc: {train_simple_acc:.4f}")
+        eval_loss, eval_acc, eval_simple_acc, eval_time = train(model, val_loader, optimizer, criterion, device)
+        logger.info(f"【{epoch + 1}/{num_epoch}】"
+              f" train time: {train_time:.2f} [s]"
+              f" loss: {train_loss:.4f}"
+              f" acc: {train_acc:.4f}"
+              f" simple acc: {train_simple_acc:.4f}"
+              f" eval time: {eval_time:.2f} [s]"
+              f" loss: {eval_loss:.4f}"
+              f" acc: {eval_acc:.4f}"
+              f" simple acc: {eval_simple_acc:.4f}"
+        )
 
         if args.snapshots:
             if not os.path.exists(args.snapshots):
@@ -517,7 +538,7 @@ def main():
         pred = pred.argmax(1).cpu().item()
         submission.append(pred)
 
-    submission = [train_dataset.idx2answer[id] for id in submission]
+    submission = [trainval_dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)
     logger.info("evaluation done.")
     torch.save(model.state_dict(), "model.pth")
