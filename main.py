@@ -2,6 +2,7 @@ import argparse
 import collections
 import gzip
 import logging
+import math
 import re
 import random
 import time
@@ -347,8 +348,252 @@ def ResNet50():
     return ResNet(BottleneckBlock, [3, 4, 6, 3])
 
 
+class PositionalEncoding(nn.Module):
+    """Positional Encoding の処理を行うモジュール
+
+    自習用教材の実装を参考に
+    """
+    def __init__(self, emb_dim: int, max_sentence_len: int) -> None:
+        super().__init__()
+
+        # 振動数の計算
+        theta_even = (
+            torch.arange(max_sentence_len)[:, None]
+            / (10000 ** (2 * torch.arange(math.ceil(emb_dim / 2))[None,:] / emb_dim))
+        )
+        theta_odd = (
+            torch.arange(max_sentence_len)[:, None]
+            / (10000 ** (2 * torch.arange(math.floor(emb_dim/2))[None,:] / emb_dim))
+        )
+
+        # Embeddingの計算: [L, dim]
+        pos_encoding_even = torch.sin(theta_even)
+        pos_encoding_odd = torch.sin(theta_odd)
+        pos_encoding = torch.zeros(max_sentence_len, emb_dim)
+        pos_encoding[:, 0::2] = pos_encoding_even
+        pos_encoding[:, 1::2] = pos_encoding_odd
+        # 学習はしないが to() などの処理対象にはする
+        pos_encoding = pos_encoding.unsqueeze(0)
+        self.register_buffer("pos_encoding", pos_encoding)
+
+    def forward(
+        self,
+        x: torch.Tensor, # (N, L, dim)
+    ) -> torch.Tensor:
+        _, L, _ = x.shape
+        x = x + self.pos_encoding[:, :L, :]
+        return x
+
+
+class ScalarDotProductAttention(nn.Module):
+    """Attension の汎化モジュール
+
+    エンコードにしか使わないのでマスクはサポートしない
+    """
+    def __init__(self, n_head: int) -> torch.Tensor:
+        super().__init__()
+        self.n_head = n_head
+
+    def forward(
+        self,
+        Q: torch.Tensor, # クエリの集合 (N, l_query, n_head, d_query)
+        K: torch.Tensor, # キーの集合 (N, l_key, n_head, d_key)
+        V: torch.Tensor, # 値の集合 (N, l_value, n_head, d_value)
+    ) -> torch.Tensor:
+        N, l_query, n_head, d_query = Q.shape
+        _, l_key, _, d_key = K.shape
+        _, l_value, _, d_value = V.shape
+
+        assert(l_key == l_value)
+        assert(d_query == d_key)
+        assert(n_head == self.n_head)
+
+        Q = Q.reshape(N, l_query, 1, n_head, d_query, 1)
+        K = K.reshape(N, 1, l_key, n_head, d_key, 1)
+        V = V.reshape(N, 1, l_value, n_head, d_value)
+
+        # Scalar Dot-Product Attention - MatMul
+        # d = d_query = d_key
+        # Q: N, l_query, 1,     n_head, d, 1
+        # K: N, 1,       l_key, n_head, d, 1
+        # Q * K: N, l_query, l_key, n_head, d, 1
+        # dim=4: d
+        x = torch.sum(Q * K, dim=4) # (N, l_query, l_key, n_head, 1)
+
+        # Scalar Dot-Product Attention - Scale
+        x = x / torch.sqrt(torch.tensor(d_key))
+
+        # Scalar Dot-Product Attention - Softmax
+        x = functional.softmax(x, dim=2) # (N, l_query, l_key, n_head, 1)
+
+        # Scalar Dot-Product Attention - MatMul
+        # L = l_key = l_value
+        # x: N, l_query, L, n_head, 1
+        # V: N, 1,       L, n_head, d_value
+        # x * V: N, l_query, L, n_head, d_value
+        # dim_2 = L
+        x = torch.sum(x * V, dim=2) # (N, l_query, n_head, d_value)
+
+        return x # (N, l_query, n_head, d_value)
+
+
+class MultiHeadAttention(nn.Module):
+    """MultiHeadAttension の実装
+
+    エンコードにしか使わないのでマスクはサポートしない
+    """
+    def __init__(
+        self,
+        emb_dim: int, # 入力の次元数（＝単語の分散表現の次元数）
+        d_query: int, # クエリの次元数
+        d_key: int, # キーの次元数
+        d_value: int, # 値の次元数
+        n_head: int, # ヘッドの本数
+    ) -> None:
+        super().__init__()
+        assert(d_query == d_key)
+        self.emb_dim = emb_dim
+        self.d_query = d_query
+        self.d_key = d_key
+        self.d_value = d_value
+        self.n_head = n_head
+
+        self.attention = ScalarDotProductAttention(n_head=n_head)
+        self.ffnn_query = torch.nn.Linear(
+            in_features = emb_dim,
+            out_features = n_head * d_query
+        )
+        self.ffnn_key = torch.nn.Linear(
+            in_features = emb_dim,
+            out_features = n_head * d_key
+        )
+        self.ffnn_value = torch.nn.Linear(
+            in_features = emb_dim,
+            out_features = n_head * d_value
+        )
+        self.ffnn = torch.nn.Linear(
+            in_features = n_head * d_value,
+            out_features = emb_dim
+        )
+
+    def forward(
+        self,
+        Q: torch.Tensor, # クエリの集合 (N, l_query, emb_dim)
+        K: torch.Tensor, # キーの集合 (N, l_key, emb_dim)
+        V: torch.Tensor, # 値の集合 (N, l_value, emb_dim)
+    ) -> torch.Tensor:
+        N, l_query, emb_dim  = Q.shape
+        _, l_key, _ = K.shape
+        _, l_value, _ = V.shape
+        assert(l_key == l_value)
+        assert(emb_dim == self.emb_dim)
+
+        Q = Q.reshape(N * l_query, emb_dim)
+        K = K.reshape(N * l_key, emb_dim)
+        V = V.reshape(N * l_value, emb_dim)
+
+        # 線形変換
+        Q = self.ffnn_query(Q) # (N * l_query, n_head * d_query)
+        K = self.ffnn_key(K) # (N * l_key, n_head * d_key)
+        V = self.ffnn_value(V) # (N * l_value, n_head * d_value)
+
+        Q = Q.reshape(N, l_query, self.n_head, self.d_query)
+        K = K.reshape(N, l_key, self.n_head, self.d_key)
+        V = V.reshape(N, l_value, self.n_head, self.d_value)
+
+        # Scalar Dot-Product Attention
+        x = self.attention.forward(Q, K, V) # (N, l_query, n_head, d_value)
+
+        # 結合＋線形変換
+        x = x.reshape(N * l_query, self.n_head * self.d_value)
+        x = self.ffnn.forward(x)
+        x = x.reshape(N, l_query, self.emb_dim)
+        return x
+
+
+class TransformerEncoderLayer(nn.Module):
+    def __init__(
+        self,
+        emb_dim: int, # 入力の次元数
+        n_head: int, # ヘッドの本数
+        d_head: int, # ヘッドの次元数
+        d_ffnn: int, # 全結合型ニューラルネットワークの中間層の次元数
+    ) -> None:
+        super().__init__()
+        self.emb_dim = emb_dim
+
+        self.multi_head_attention = MultiHeadAttention(
+            emb_dim=emb_dim,
+            d_query=d_head,
+            d_key=d_head,
+            d_value=d_head,
+            n_head=n_head,
+        )
+        self.layer_norm_attention = torch.nn.LayerNorm(emb_dim)
+
+        # Position-wise Feed-Forward Neural Network
+        self.ffnn = nn.Sequential(
+            torch.nn.Linear(emb_dim, d_ffnn),
+            torch.nn.GELU(),
+            torch.nn.Linear(d_ffnn, emb_dim),
+        )
+        self.layer_norm_ffnn = torch.nn.LayerNorm(emb_dim)
+
+    def forward(
+        self,
+        src: torch.Tensor, # ソース文 (N, L, emb_dim)
+    ) -> torch.Tensor:
+        N, L, emb_dim = src.shape
+        assert(emb_dim == self.emb_dim)
+
+        # Multi-Head Attention
+        shortcut = src
+        x = shortcut + self.multi_head_attention.forward(
+            Q=src,
+            K=src,
+            V=src,
+        )
+        x = self.layer_norm_attention.forward(x)
+
+        # Position-wise Feed-Forward Neural Network
+        shortcut = x
+        x = x.reshape(-1, self.emb_dim)
+        x = self.ffnn.forward(x)
+        x = shortcut + x.reshape(N, L, self.emb_dim)
+        x = self.layer_norm_ffnn(x)
+
+        return x
+
+
+class TransformerEncoder(nn.Module):
+    def __init__(
+        self,
+        emb_dim: int, # 入力の次元数
+        n_head: int, # ヘッドの本数
+        d_head: int, # ヘッドの次元数
+        d_ffnn: int, # 全結合型ニューラルネットワークの中間層の次元数
+        n_layer: int, # Transformer Encoder Layerを積み上げる数
+    ) -> None:
+        super().__init__()
+        self.n_layer = n_layer
+        self.transformer_encoder_layers = nn.Sequential(*[
+            TransformerEncoderLayer(
+                emb_dim=emb_dim,
+                n_head=n_head,
+                d_head=d_head,
+                d_ffnn=d_ffnn,
+            ) for _ in range(n_layer)
+        ])
+
+    def forward(
+        self,
+        src: torch.Tensor, # ソース文 (N, L, emb_dim)
+    ) -> torch.Tensor:
+        return self.transformer_encoder_layers(src)
+
+
 class VQAModel(nn.Module):
-    def __init__(self, vocab_size: int, n_answer: int):
+    def __init__(self, vocab_size: int, max_question_len: int, n_answer: int):
         super().__init__()
         self.resnet = ResNet18()
 
@@ -356,8 +601,20 @@ class VQAModel(nn.Module):
         self.embedding_matrix = nn.Parameter(
             torch.rand((vocab_size, emb_dim), dtype=torch.float),
         )
-        lstm_dim = 256
-        self.bilstm = nn.LSTM(emb_dim, lstm_dim, 1, batch_first=True, bidirectional=True)
+        self.positional_encoding = PositionalEncoding(emb_dim=emb_dim, max_sentence_len=max_question_len)
+
+        # この辺のハイパーパラメーターはすごーく適当
+        transformer_heads = 10
+        transformer_head_dim = 64
+        transformer_hidden_dim = 256
+        transformer_layers = 6
+        self.transformer = TransformerEncoder(
+            emb_dim,
+            transformer_heads,
+            transformer_head_dim,
+            transformer_hidden_dim,
+            transformer_layers,
+        )
 
         self.fc = nn.Sequential(
             nn.Linear(1024, 512),
@@ -377,9 +634,12 @@ class VQAModel(nn.Module):
         # h: (フォーワードの最終出力, バックワードの最終出力)
         # c: セルのパラメーター
         emb = functional.embedding(question, self.embedding_matrix)
-        out, hc = self.bilstm(emb)  # テキストの特徴量
-        h, c = hc
-        question_feature = torch.cat([h[0], h[1]], dim=1)
+        emb = self.positional_encoding.forward(emb)
+
+        question_features = self.transformer.forward(emb)
+        # BOS の特徴量を質問文全体の特徴量であるとして扱う
+        # (CLS トークン相当)
+        question_feature = question_features[:, 0, :]
 
         x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
@@ -485,6 +745,9 @@ def main():
     )
 
     test_dataset.update_dict(trainval_dataset)
+    max_question = max(trainval_dataset.max_question, test_dataset.max_question)
+    trainval_dataset.max_question = max_question
+    test_dataset.max_question = max_question
 
     # 訓練データの量を制限
     if args.limit:
@@ -504,7 +767,11 @@ def main():
     val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=128, shuffle=True, num_workers=os.cpu_count(), pin_memory=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=os.cpu_count(), pin_memory=True)
 
-    model = VQAModel(vocab_size=len(trainval_dataset.vocabulary), n_answer=len(trainval_dataset.answer2idx)).to(device)
+    model = VQAModel(
+        vocab_size=len(trainval_dataset.vocabulary),
+        max_question_len=max_question + 2,  # BOS, EOS を加算。実は BOS / EOS 自体いらないのでは？
+        n_answer=len(trainval_dataset.answer2idx),
+    ).to(device)
 
     # optimizer / criterion
     startepoch = 0
