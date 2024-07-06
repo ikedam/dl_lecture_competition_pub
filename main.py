@@ -604,7 +604,7 @@ class VQAModel(nn.Module):
         self.positional_encoding = PositionalEncoding(emb_dim=emb_dim, max_sentence_len=max_question_len)
 
         # この辺のハイパーパラメーターはすごーく適当
-        transformer_heads = 10
+        transformer_heads = 20
         transformer_head_dim = 64
         transformer_hidden_dim = 256
         transformer_layers = 6
