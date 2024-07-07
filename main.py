@@ -356,11 +356,11 @@ class VQAModel(nn.Module):
         self.embedding_matrix = nn.Parameter(
             torch.rand((vocab_size, emb_dim), dtype=torch.float),
         )
-        lstm_dim = 256
+        lstm_dim = 128
         self.bilstm = nn.LSTM(emb_dim, lstm_dim, 1, batch_first=True, bidirectional=True)
 
         self.fc = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(768, 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, n_answer)
         )
