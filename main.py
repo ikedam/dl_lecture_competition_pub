@@ -352,7 +352,7 @@ class VQAModel(nn.Module):
         super().__init__()
         self.resnet = ResNet18()
 
-        emb_dim = 512
+        emb_dim = 256
         self.embedding_matrix = nn.Parameter(
             torch.rand((vocab_size, emb_dim), dtype=torch.float),
         )
@@ -360,7 +360,8 @@ class VQAModel(nn.Module):
         self.bilstm = nn.LSTM(emb_dim, lstm_dim, 1, batch_first=True, bidirectional=True)
 
         self.fc = nn.Sequential(
-            nn.Linear(768, 512),
+            nn.Linear(512 + lstm_dim * 2, 512),
+            nn.LayerNorm(512),
             nn.ReLU(inplace=True),
             nn.Linear(512, n_answer)
         )
