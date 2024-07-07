@@ -414,8 +414,8 @@ class ScalarDotProductAttention(nn.Module):
 
         # Scalar Dot-Product Attention - MatMul
         # d = d_query = d_key
-        # Q: N, l_query, 1,     n_head, d, 1
-        # K: N, 1,       l_key, n_head, d, 1
+        # Q:     N, l_query, 1,     n_head, d, 1
+        # K:     N, 1,       l_key, n_head, d, 1
         # Q * K: N, l_query, l_key, n_head, d, 1
         # dim=4: d
         x = torch.sum(Q * K, dim=4) # (N, l_query, l_key, n_head, 1)
@@ -548,19 +548,19 @@ class TransformerEncoderLayer(nn.Module):
 
         # Multi-Head Attention
         shortcut = src
+        src = self.layer_norm_attention.forward(src)
         x = shortcut + self.multi_head_attention.forward(
             Q=src,
             K=src,
             V=src,
         )
-        x = self.layer_norm_attention.forward(x)
 
         # Position-wise Feed-Forward Neural Network
         shortcut = x
         x = x.reshape(-1, self.emb_dim)
+        x = self.layer_norm_ffnn(x)
         x = self.ffnn.forward(x)
         x = shortcut + x.reshape(N, L, self.emb_dim)
-        x = self.layer_norm_ffnn(x)
 
         return x
 
@@ -575,7 +575,6 @@ class TransformerEncoder(nn.Module):
         n_layer: int, # Transformer Encoder Layerを積み上げる数
     ) -> None:
         super().__init__()
-        self.n_layer = n_layer
         self.transformer_encoder_layers = nn.Sequential(*[
             TransformerEncoderLayer(
                 emb_dim=emb_dim,
@@ -598,9 +597,7 @@ class VQAModel(nn.Module):
         self.resnet = ResNet18()
 
         emb_dim = 512
-        self.embedding_matrix = nn.Parameter(
-            torch.rand((vocab_size, emb_dim), dtype=torch.float),
-        )
+        self.embedding = nn.Embedding(vocab_size, emb_dim)
         self.positional_encoding = PositionalEncoding(emb_dim=emb_dim, max_sentence_len=max_question_len)
 
         # この辺のハイパーパラメーターはすごーく適当
@@ -626,14 +623,7 @@ class VQAModel(nn.Module):
         image_feature = self.resnet(image)  # 画像の特徴量
 
         # question: [バッチサイズ, 系列長, vocab_size]
-        # → [バッチサイズ, 系列長, emb_dim]
-        # → [バッチサイズ, lstm_dim] x 2
-        # → [バッチサイズ, lstm_dim x 2]
-        # out: 各単語の隠れ出力
-        # hc: (h, c)
-        # h: (フォーワードの最終出力, バックワードの最終出力)
-        # c: セルのパラメーター
-        emb = functional.embedding(question, self.embedding_matrix)
+        emb = self.embedding(question)
         emb = self.positional_encoding.forward(emb)
 
         question_features = self.transformer.forward(emb)
