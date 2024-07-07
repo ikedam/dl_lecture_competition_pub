@@ -356,8 +356,8 @@ class VQAModel(nn.Module):
         self.embedding_matrix = nn.Parameter(
             torch.rand((vocab_size, emb_dim), dtype=torch.float),
         )
-        lstm_dim = 256
-        self.bilstm = nn.LSTM(emb_dim, lstm_dim, 1, batch_first=True, bidirectional=True)
+        rnn_dim = 256
+        self.bi_rnn = nn.RNN(emb_dim, rnn_dim, num_layers=1, batch_first=True, bidirectional=True)
 
         self.fc = nn.Sequential(
             nn.Linear(1024, 512),
@@ -370,16 +370,12 @@ class VQAModel(nn.Module):
 
         # question: [バッチサイズ, 系列長, vocab_size]
         # → [バッチサイズ, 系列長, emb_dim]
-        # → [バッチサイズ, lstm_dim] x 2
-        # → [バッチサイズ, lstm_dim x 2]
-        # out: 各単語の隠れ出力
-        # hc: (h, c)
-        # h: (フォーワードの最終出力, バックワードの最終出力)
-        # c: セルのパラメーター
+        # → [バッチサイズ, rnn_dim x 2]
+        # out: 最終レイヤーの出力 (N, L, 2*rnn_dim)
+        # h_n: 隠れ層の値: (N, D*レイヤー数, rnn_dim)
         emb = functional.embedding(question, self.embedding_matrix)
-        out, hc = self.bilstm(emb)  # テキストの特徴量
-        h, c = hc
-        question_feature = torch.cat([h[0], h[1]], dim=1)
+        out, h_n = self.bi_rnn.forward(emb)  # テキストの特徴量
+        question_feature = out[:, -1, :]
 
         x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
