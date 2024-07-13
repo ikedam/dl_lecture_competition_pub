@@ -445,7 +445,7 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("-s", "--snapshots", type=str, default=None)
     parser.add_argument("-l", "--limit", type=int, default=None)
-    parser.add_argument("-e", "--epoch", type=int, default=20)
+    parser.add_argument("-e", "--epoch", type=int, default=8)
     # 2だと性能が下がる
     parser.add_argument("-f", "--freq", type=int, default=1)
     parser.add_argument("--holdout", type=float, default=0.25)
