@@ -16,9 +16,11 @@ T4 GPU を使用して 1 エポック 6 分弱、全実行完了に 1 時間く�
 Google Colab のライブラリーバージョンが変わると実行できなくなる可能性があります。
 最後に実行したときのライブラリーの状態を [requirements-colab-2024-07-05.txt](./requirements-colab-2024-07-05.txt) に記録してあります。
 
+
 ## ファイル構成
 
 * main.py: 学習プログラム
+    * `python main.py -h` でオプションが表示されます。
 * requirements類:
     * requirements.txt: main.py の依存ライブラリー
     * requirements-local.txt: ローカルで開発したときに使用した環境の依存ライブラリー (pip freeze したもの)。IDE の動作に使っただけで、実際のプログラム実行ができるものになっているかは保証されません。

@@ -22,6 +22,7 @@ import numpy as np
 import pandas
 import torch
 import torch.nn as nn
+import torch.utils.data
 import torchtext.data.utils
 import torchtext.vocab
 from torch.nn import functional
@@ -437,18 +438,22 @@ def eval(model, dataloader, optimizer, criterion, device):
 
 
 def main():
+    # REP03: 処理の進行と時刻の対応付けを行えるようにロガーを使用し、タイムスタンプを出力する。
+    # ライブラリーからの箇条なログ出力を防ぐためにデフォルトのログレベルは WARN とし、
+    # プログラム内のログは INFO レベルで出力する。
+    # -v オプションで DEBUG レベルのログを出力する。
     logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s: %(message)s")
     logger = logging.getLogger(__name__)
     logger.setLevel(logging.INFO)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("-v", "--verbose", action="store_true")
-    parser.add_argument("-s", "--snapshots", type=str, default=None)
-    parser.add_argument("-l", "--limit", type=int, default=None)
-    parser.add_argument("-e", "--epoch", type=int, default=8)
+    parser.add_argument("-v", "--verbose", action="store_true", help="set loglevel to DEBUG")
+    parser.add_argument("-s", "--snapshots", type=str, default=None, help="save and reuse model parameters/optimizer parameters/ranndom states for each epoch to that directory")
+    parser.add_argument("-l", "--limit", type=int, default=None, help="limit dataset size")
+    parser.add_argument("-e", "--epoch", type=int, default=8, help="epochs to run (default=%(default)s)")
     # 2だと性能が下がる
-    parser.add_argument("-f", "--freq", type=int, default=1)
-    parser.add_argument("--holdout", type=float, default=0.25)
+    parser.add_argument("-f", "--freq", type=int, default=1, help="least frequency to add word into vocabulary")
+    parser.add_argument("--holdout", type=float, default=0.25, help="fraction for eval dataset")
 
     args = parser.parse_args()
 
@@ -458,6 +463,8 @@ def main():
     # deviceの設定
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    # REP02: 実行に使用しているデバイスを確認できるようにする。
+    # (意図せずGCPUが使われていないことに気付けるようにする)
     logger.info("running on %s", device)
     logger.info("cpu_count %s", os.cpu_count())
 
@@ -486,12 +493,19 @@ def main():
 
     test_dataset.update_dict(trainval_dataset)
 
-    # 訓練データの量を制限
+    # REP04: 訓練データの量を制限
+    # 全データを使用すると1エポックの実行に時間がかかり、
+    # プログラムエラーの確認の足かせになるため、
+    # 動作確認時に使用データを減らして短時間で実行確認ができるようにする。
     if args.limit:
         logger.warning("limit dataset to %s", args.limit)
         trainval_dataset.limit = args.limit
         test_dataset.limit = args.limit
 
+    # REP01: 汎化性能の評価/過学習の検知をできるようにするため、訓練データと検証データの分割を行う。
+    # デフォルトでは 0.25 (25%, 5,000件) を検証データとして使用する。 --holdout オプションで変更可能。
+    # データセットが分割前の状態で回答データのone-hotベクトルを作成するようになっているため
+    # 厳密に検証データとテストデータが同条件にならないと考えられるが、(実装工数の都合から)許容する。
     train_dataset, val_dataset = torch.utils.data.random_split(trainval_dataset, [1.0 - args.holdout, args.holdout])
 
     # https://qiita.com/sugulu_Ogawa_ISID/items/62f5f7adee083d96a587#1-dataloader%E3%81%AB%E3%81%A4%E3%81%84%E3%81%A6
@@ -508,11 +522,13 @@ def main():
 
     # optimizer / criterion
     startepoch = 0
-    num_epoch = args.epoch
+    num_epoch = args.epoch  # REP04: エポック数を実行オプションで変更可能にする。
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
     if args.snapshots and os.path.exists(args.snapshots):
+        # REP05: 保存済みの学習データがある場合、そこから学習を再開する。
+        # 保存済みの学習データにはモデルのパラメーター、optimizerのパラメーター、乱数状態を含む。
         files = sorted(
             [
                 f for f in os.listdir(args.snapshots)
@@ -550,6 +566,8 @@ def main():
         )
 
         if args.snapshots:
+            # REP05: 次回実行時に途中から学習を再開できるよう、
+            # モデルのパラメーター、optimizerのパラメーター、乱数状態を保存する。
             if not os.path.exists(args.snapshots):
                 os.makedirs(args.snapshots, exist_ok=True)
 
